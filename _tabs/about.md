@@ -5,33 +5,34 @@ icon: fas fa-info-circle
 order: 4
 ---
 
-👋 Hi, I’m **Naor Haziz** - a security researcher, Rust devotee, and speaker at conferences like [fwd:cloudsec](https://fwdcloudsec.org) and [Black Hat USA](https://www.blackhat.com/us-25/briefings/schedule/#ecs-cape--hijacking-iam-privileges-in-amazon-ecs-45686).
+👋 Hi, I’m **Naor Haziz** - a security researcher, Rust enthusiast, and speaker at security conferences.
 
 ---
 
-🕵️‍♂️ My work focuses on breaking and understanding the boundaries between cloud infrastructure and operating system internals - with a strong bias toward real-world impact and clean, effective tooling.
+🔍 I focus on exploring the intersection between **cloud infrastructure** and **OS internals**, aiming to expose real-world vulnerabilities and build tooling that empowers defenders.
 
-💡 My recent research includes:
+### 🛠️ Projects & Research
 
-- **ECS-cape** - A deep-dive into hijacking IAM privileges from within Amazon ECS.
-- ptrace / Kernel & eBPF instrumentation for workload tracing.
-- Building security observability tools in Rust.
-
----
-
-🧰 Tech I enjoy:
-- **Languages**: Rust, C/C++
-- **Cloud Platforms**: AWS, GCP, Azure
-- **Systems**: Deep knowledge of both Windows and Linux internals
+- 🧪 **ECScape** – A vulnerability research project uncovering IAM privilege escalation inside Amazon ECS tasks.
+- 🔧 Building security observability tools using `ptrace`, eBPF, and Rust.
+- 🧵 OS instrumentation for workload tracing and cloud introspection.
 
 ---
 
-📫 Want to connect?
+### 🧰 Tech I Love
+
+- **Languages:** Rust, C, C++
+- **Cloud Platforms:** AWS, GCP, Azure
+- **Systems:** Deep familiarity with Windows and Linux internals
+
+---
+
+### 🌐 Connect with me
 
 - [LinkedIn](https://www.linkedin.com/in/naorhaziz)
 - [GitHub](https://github.com/naorhaziz)
-- Email: naorhaziz@gmail.com
+- 📧 Email: naorhaziz@gmail.com
 
 ---
 
-Thanks for stopping by ✨
+Thanks for stopping by, feel free to reach out! ✨

@@ -10,4 +10,7 @@ image: /assets/img/ecscape.png
 
 This post will explore how task networking and container-level isolation in Amazon ECS can be abused to escalate IAM privileges — including real-world scenarios and tooling.
 
-Until then, here’s the [official talk page](https://www.blackhat.com/us-25/briefings/schedule/#ecs-cape--hijacking-iam-privileges-in-amazon-ecs-45686).
+🛡️ **Conference Appearances:**
+- 🎤 [Black Hat USA 2025 Briefing](https://www.blackhat.com/us-25/briefings/schedule/#ecs-cape--hijacking-iam-privileges-in-amazon-ecs-45686)
+- 🌩️ [fwd:cloudsec 2025 Speaker Profile](https://pretalx.com/fwd-cloudsec-2025/speaker/YXNDY7/)
+- 📺 [Watch the Talk on YouTube](https://www.youtube.com/watch?v=WXdB-9pTqAU)
