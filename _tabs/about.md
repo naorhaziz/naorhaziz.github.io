@@ -33,7 +33,7 @@ order: 4
 
 - [LinkedIn](https://www.linkedin.com/in/naorhaziz)
 - [GitHub](https://github.com/naorhaziz)
-- 📧 Email: naorhaziz@gmail.com
+- 📧 Email: [naorhaziz@gmail.com](mailto:naorhaziz@gmail.com)
 
 ---
 
