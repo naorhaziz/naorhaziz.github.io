@@ -7,6 +7,8 @@ order: 4
 
 👋 Hi, I’m **Naor Haziz** - a security researcher, Rust enthusiast, and speaker at security conferences.
 
+![Alt text](/assets/img/naor_talk.jpg)
+
 ---
 
 🔍 I focus on exploring the intersection between **cloud infrastructure** and **OS internals**, aiming to expose real-world vulnerabilities and build tooling that empowers defenders.
