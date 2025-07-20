@@ -76,31 +76,45 @@ Even though ECS abstracts away a lot of complexity, when using the EC2 launch ty
     
 *   The agent’s responsibilities include:
     
-    *   **Registering the instance** to the ECS control plane (so it appears in your cluster) and maintaining a heartbeat.
+    *   **Instance registration & heartbeat:** Registers the EC2 instance with the ECS control plane and continuously polls (long‑poll) for task and state change directives.
+
+    *   **Task lifecycle management:** Creates, starts, stops, and monitors containers according to the control plane’s desired state directives; relays status updates (RUNNING, STOPPED, exit codes, health, etc.).
         
-    *   **Pulling container images** from ECR (or other registries) and launching/stopping containers via Docker.
+    *   **Image pulls coordination:** Orchestrates image pulls via the local runtime. For private ECR, it requests an auth token from the ECS control plane; the control plane uses the task execution role (if specified) to authorize ECR/Secrets/Logs actions—those creds are not exposed to your application.
+
+    *   **Networking setup:** Sets up veth pairs / CNI configuration, attaches ENIs (for awsvpc mode), and may program iptables rules (older bridge/host modes) for isolation and routing to AWS endpoints (IMDS, 169.254.170.2, etc.).
+
+    *   **Logs / telemetry relay:** Ships container/task state changes; integrates with CloudWatch Logs/FireLens configurations (the actual CloudWatch API calls again authorized via the execution role at the service side).
         
-    *   **Setting up networking** for tasks (creating veth interfaces, configuring iptables rules to enforce isolation and to allow the task to reach AWS endpoints like IMDS or ECR as needed).
-        
-    *   **Fetching task credentials:** When a new task with an IAM role starts, the agent calls STS to assume that task role (using the instance role’s permissions to do so), and then provides the credentials securely to the container.
-        
+    *   **Credential delivery:** When a task specifies a task role, the ECS control plane service (ecs-tasks.amazonaws.com) performs the sts:AssumeRole. The resulting short‑lived credentials are pushed down to the agent, which caches and serves them only to the correct task/container via the task metadata / credentials endpoint (169.254.170.2$AWS_CONTAINER_CREDENTIALS_RELATIVE_URI).        
 
 ### **ecsInstanceRole**
 
-*   The default IAM role for every EC2 host in an ECS cluster
+*   A _typical_ default IAM role (instance profile) attached to ECS EC2 hosts (name can be different; ecsInstanceRole is just the common default).
     
-*   The role lets the ECS agent do its day-to-day chores:
+*   Has the **managed policy** AmazonEC2ContainerServiceforEC2Role (plus any custom additions you made).
     
-    *   **Cluster-level control-plane calls:** ecs:RegisterContainerInstance, ecs:DiscoverPollEndpoint, ecs:Poll, ecs:StartTelemetrySession
-        
-    *   **Image pulls:** ecr:GetAuthorizationToken, ecr:BatchGetImage
-        
-    *   **Logging & metrics:** logs:CreateLogStream, logs:PutLogEvents
-        
-    *   **Role impersonation:** sts:AssumeRole on any task role so the agent can hand out the right temp credentials to each task.
-        
-*   **How the agent gets its own keys**: It transparently **queries IMDS** (169.254.169.254/latest/meta-data/iam/security-credentials/ecsInstanceRole) to retrieve and refresh these credentials - exactly the same curl an attacker can run from inside any container if IMDS isn’t blocked.
+*   Grants the ECS agent only the permissions it needs to register with the cluster and operate tasks – **not** your application’s task IAM permissions.
     
+**Key allowed actions:**
+
+*   _Control plane:_ ecs:RegisterContainerInstance, ecs:DiscoverPollEndpoint, ecs:Poll, ecs:Submit\*, ecs:StartTelemetrySession
+    
+*   _ECR auth & image pulls:_ ecr:GetAuthorizationToken, ecr:BatchGetImage
+    
+*   _Logging/metrics:_ logs:CreateLogStream, logs:PutLogEvents    
+
+![Alt text](/assets/img/ecscape/ecs_instance_role.png)
+
+**How the agent gets credentials**
+
+It transparently **queries IMDS** (169.254.169.254/latest/meta-data/iam/security-credentials/ecsInstanceRole) to retrieve and refresh these credentials - exactly the same curl an attacker can run from inside any container if IMDS isn’t blocked.
+
+**Important distinctions**
+
+*   This role ≠ _task role_. Task/application credentials are assumed by the ECS **control plane** and pushed down separately.
+    
+*   Keep the instance role minimal; don’t add broad sts:AssumeRole or ecs:\* wildcards unless required.
 
 ### **From Host Role to Task Role - Where Isolation Should Happen**
 
@@ -108,24 +122,26 @@ So far we’ve looked at the **ecsInstanceRole** (the host-level identity) and h
 
 AWS documentation:
 
+![Alt text](/assets/img/ecscape/aws_doc_before.jpg)
+
+
 ### **Credential Vending to Tasks: Convenience vs. Risk**
 
-How do containers actually get their unique AWS credentials? Here’s the lifecycle, which is important to understand both the intended isolation and where it can break:
+How do ECS tasks get AWS credentials ? The actual lifecycle:
 
-1.  **Agent assumes the task role:** When a task starts, the ECS agent on the host invokes sts:AssumeRole using the instance role credentials. The target is the IAM role specified in the task definition. If successful, STS returns a **credential set** (AccessKeyId, SecretAccessKey, SessionToken, expiration) for that role. This credential is tagged with the role and the task (so CloudTrail can later show which task assumed it).
-    
-2.  **Agent stores the credentials and exposes them via metadata endpoint:** The ECS agent runs a local HTTP server on the host (at another link-local address 169.254.170.2). It will store the new task credentials and serve them at a unique path, e.g. http://169.254.170.2/v2/credentials/ - where is a UUID specific to that task’s credentials.
-    
-3.  **Agent updates iptables:** To enforce isolation, the agent programs the host’s firewall (iptables) to allow the specific task’s network namespace to access **only** its own credentials URL on 169.254.170.2. In other words, it DNATs or maps that particular URL so that if Container A tries to hit 169.254.170.2/v2/credentials/A-UUID, it will succeed, but if it tries to hit B-UUID (credentials for another task), it should be blocked.
-    
-4.  **Container receives the URI:** The agent injects an environment variable into the container’s environment: AWS\_CONTAINER\_CREDENTIALS\_RELATIVE\_URI=/v2/credentials/. This tells the AWS SDK inside the container where to fetch credentials. When the container makes AWS SDK calls, the SDK will issue a HTTP GET to the credential endpoint (which resolves to the agent’s IP) and retrieve the JSON blob of credentials.
-    
-5.  **Credential rotation:** These role credentials are short-lived (usually up to 6 hours by default for ECS task roles). The agent will proactively refresh them by calling STS again before expiration and update the values served at the same URI, so the container can continuously operate with valid creds.
-    
+* **Control plane assumes roles:** When ECS schedules a task, the ECS service principal (`ecs-tasks.amazonaws.com`) calls `sts:AssumeRole` for the *execution role* (image pulls / secrets / logs) and the *task role* (your app’s AWS API access).
+
+* **Credentials pushed to agent (ACS):** The control plane sends `IamRoleCredentials` messages over the long‑lived agent (ACS) connection. Each message carries: credentialsId, access key, secret key, session token, expiration.
+
+* **Agent caches & serves:** The agent stores these in memory and exposes the *task role* credentials. It injects  
+  `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI=/v2/credentials/<credentialsId>` (or the v3/v4 equivalent) into the container’s environment. Execution role credentials are **not** exposed to the application.
+
+* **Task retrieves on demand:** The SDK inside the container HTTP GETs that relative URI and receives only its own credential JSON. Isolation relies mainly on per‑task network namespaces (awsvpc) + unguessable credential path + the agent returning only a matching `credentialsId`—not on per‑path iptables filtering in modern setups.
 
 This mechanism means developers don’t have to bake AWS keys into their containers or fetch them from elsewhere - it’s automatically managed by ECS. The **downside** is that a lot of trust is placed on the network namespace and firewall rules isolating that credential service. If a container can break out of its network restrictions or otherwise query the agent’s credential service for another task’s ID, it would immediately obtain those other credentials. **In short, the security of task role isolation hinges on the correctness of the ECS agent and its namespace isolation.** ECScape will exploit the ECS agent in a different way, but it’s worth noting this general principle: containers are not hard security boundaries. A misconfiguration or vulnerability in the isolation can be catastrophic (any weakness in those iptables rules can let one container reach data meant for another, it instantly inherits the neighbor’s AWS permissions).
 
 With this background, we can now understand how ECScape was discovered and how it works step-by-step.
+
 
 **Discovery**
 -------------
@@ -140,7 +156,7 @@ For a monitoring dashboard, that one field matters; without it, I can’t group 
 
 ![Alt text](/assets/img/ecscape/service_name.jpg)
 
-Naturally, I wondered if my eBPF sensor could simply **mimic the agent**: query the same endpoint and stitch the data together. But when I inspected the **ecsInstanceRole** attached to the host, I noticed something odd: it **does not have ecs:ListServices or any API that would normally reveal a service name**. Yet the agent obviously knew that name- enough to hand it to me over the metadata endpoint.
+Naturally, I wondered if my eBPF sensor could simply **mimic the agent**: query the same endpoint and stitch the data together. But when I inspected the **ecsInstanceRole** attached to the host, I noticed something odd: it **does not have ecs:ListServices or any API that would normally reveal a service name**. Yet the agent obviously knew that name - enough to hand it to me over the metadata endpoint.
 
 Curiosity led me down a rabbit hole of packet capture. I set up a small local proxy to watch the traffic between the ECS agent and the AWS endpoints. **What I observed was startling:**
 
@@ -178,7 +194,16 @@ Let’s break these down:
 
 The attacker starts from **within a compromised container** (any low-privileged ECS task running on EC2). Because IMDS is available by default, the container can query the instance metadata service. A simple curl request to http://169.254.169.254/latest/meta-data/iam/security-credentials/{InstanceProfileName} will yield the **Access Key, Secret Key, and Session Token** for the EC2 host’s role. These are the credentials the ECS agent normally uses. Now the malicious container has them.
 
-At this point, the attacker essentially holds the identity of the ECS agent (or more accurately, the identity of the entire EC2 instance in AWS’s eyes). These credentials typically have names like ecsInstanceRole/instance-id in CloudTrail logs, indicating an STS session for the instance role. With these, the attacker can do a lot of things the agent can do – but importantly, they cannot directly assume a task role yet, because while they have the power to call sts:AssumeRole, they would need to know each task role’s ARN and do it one by one. There’s an easier route: let AWS give them all the credentials via the agent’s channel.
+![Alt text](/assets/img/ecscape/imds_role.png)
+
+At this point the attacker possesses **the instance profile’s STS session credentials** (an identity representing the EC2 _container instance_). **These are** _**not**_ **the task role credentials and do** _**not**_ **automatically allow assuming task roles** because:
+
+*   Typical ECS task roles **trust the service principal** ecs-tasks.amazonaws.com, _not_ the instance role.
+    
+*   The instance profile policy usually lacks sts:AssumeRole permission on task roles anyway.
+    
+
+So directly calling sts:AssumeRole on arbitrary task roles with the instance creds normally fails due to the _trust policy_ (and often IAM permission) barrier.
 
 **Security Note:** There will be **CloudTrail logs** for this initial step only if the attacker uses the stolen credentials outside the instance. Simply reading IMDS does not create a CloudTrail event (it’s just an HTTP GET on the instance). But any subsequent AWS API calls made with these credentials (like in the next steps) will show up in CloudTrail as actions performed by the instance role. For example, calling ecs:DiscoverPollEndpoint or ecs:Poll (next steps) will be logged as the instance role calling those APIs.
 
@@ -211,13 +236,52 @@ How to get these? The ECS Task Metadata endpoint (169.254.170.2/v4/...) accessib
 
 However, ECS has another introspection endpoint on the agent (normally used on the host, not from inside a container) that can list the container instance ARN. In practice, I discovered that by querying a certain path or using the agent’s local credentials, you could retrieve the container instance ARN. In some cases, one could also call ecs:ListContainerInstances with the cluster, but that might require additional IAM permissions that the instance role may not grant freely. In my exploit, I leveraged an **introspection API** that the agent exposes - this returned all the info I needed, including the container instance ARN and even the agent’s software version.
 
+![Alt text](/assets/img/ecscape/agent_introspection.png)
+
 The fact that a container could access the agent’s introspection API is itself a minor isolation gap. Normally, that API might be bound to localhost or a unix socket, but if it’s on the link-local and the iptables aren’t filtering it out, a container could reach it. This is a smaller part of the exploit chain, but highlights how a single oversight can aid an attacker.
 
 Armed with the identifiers, the attacker is ready to masquerade as the agent.
 
-### **Step 4: Craft and Sign the WebSocket Connection (ecs:Poll via ACS)**
+### **Step 4: Forge & Sign the ACS WebSocket (Impersonating the Agent)**
 
-Using the data above, the attacker constructs a WebSocket handshake to the previously obtained Poll endpoint URL (from Step 2). This request must be **SigV4-signed** using the instance role credentials - essentially treating the WebSocket upgrade as a signed HTTPS request. 
+Using:
+
+*   **Poll (ACS) endpoint URL** from Step 2 (e.g. https://ecs-a-1..amazonaws.com/ws – treat as opaque).
+    
+*   **Identifiers / metadata** from Step 3:
+    
+    *   agentHash (build fingerprint)
+        
+    *   agentVersion (e.g. 1.79.0)
+        
+    *   clusterArn
+        
+    *   containerInstanceArn
+        
+    *   dockerVersion (e.g. 20.10.24)
+        
+    *   protocolVersion (e.g. 1)
+        
+    *   initial seqNum (e.g. 1)
+        
+    *   sendCredentials=true (flag to receive credential payloads)
+        
+
+You construct a **WebSocket URL** like:
+
+```
+wss://ecs-a-1.<region>.amazonaws.com/ws?
+  agentHash=<agent-hash>&
+  agentVersion=<agent-version>&
+  clusterArn=arn:aws:ecs:<region>:<account-id>:cluster/<cluster-name>&
+  containerInstanceArn=arn:aws:ecs:<region>:<account-id>:container-instance/<instance-uuid>&
+  dockerVersion=<docker-version>&
+  protocolVersion=<protocol-version>&
+  seqNum=1&
+  sendCredentials=true
+```
+
+This request must be SigV4‑signed using the stolen instance profile credentials—treat the WebSocket upgrade exactly like a signed HTTPS GET. Those credentials must include (via their IAM policy) permission for at least ecs:Poll (and typically ecs:DiscoverPollEndpoint); without ecs:Poll the control plane will reject the agent channel connection.
 
 I added the query parameter sendCredentials=true to the URL - this is the magic flag that tells the ACS (Agent Communication Service) that, upon connecting, the agent is interested in receiving IAM credential payloads for all tasks. 
 
@@ -225,51 +289,30 @@ With the signing complete (including proper AWS date headers, authorization head
 
 It’s important to note: the ECS backend did not immediately invalidate the real agent’s session. In fact, I ended up with two concurrent connections for the same container instance - one was the real agent, and one was my impersonating session. The control plane effectively **broadcasted** messages to both connections. (Had AWS limited it to one connection at a time, my exploit might have knocked the real agent offline, which could raise flags. But here, I could stay stealthy, just eavesdropping.)
 
-### **Step 5: Receive All Task Credentials from ACS**
+### **Step 5: Harvest All Task Role Credentials from ACS**
 
-Once the WebSocket handshake succeeded, I was effectively “inside” the **Agent Communication Service (ACS)** stream. ACS is a proprietary, JSON-encoded protocol that rides over a long-lived WebSocket between every ECS agent and the regional control-plane shard that manages its cluster. The channel is multiplexed:
+With the forged WebSocket live, you’re now riding the same multiplexed ACS stream the real ECS agent uses. Over this channel the **ECS control plane** continuously pushes structured messages: heartbeats (keep‑alive + sequencing), task state directives (start/stop/update), telemetry, and **IamRoleCredentials** payloads.
 
-*   **Heartbeat + Ack** - Keep-alive pings, sequence confirmation.
-    
-*   **Task Manifest** - ”Start / stop these containers” directives.
-    
-*   **IAM Role Credentials**
-    
-*   **…**
-    
+**Important clarification:** The _ECS service principal_ (ecs-tasks.amazonaws.com) is the actor that performs sts:AssumeRole for each task role (and execution role, if present). The agent never calls STS itself. Instead, ECS _assumes the role on your behalf_, obtains a temporary credential set, then **delivers (moves) those credentials down to the agent** via ACS. The agent just caches them in memory and serves the task role creds through the per‑task metadata/credentials endpoint; execution role creds stay internal.
 
-Essentially, the ECS control plane sent down an IamRoleCredentials message for each running task on that instance. This included:
+Because your forged session included the sendCredentials=true flag and authenticated as the correct container instance, the control plane pushes an IamRoleCredentials message for every currently running task that has a task role. Each message you observe includes the task’s ARN (so you can map to the workload), the IAM role ARN, a credentials UUID (later used in the metadata relative URI), the temporary key trio (AccessKeyId, SecretAccessKey, SessionToken), an expiration timestamp, and a role type indicator (application vs. execution). If there are, say, five tasks with roles on that host, you immediately harvest five distinct credential sets. One belongs to your compromised task—irrelevant—but the others represent lateral escalation paths.
 
-*   The **Task ARN** and role identifier,
-    
-*   The Access Key ID, Secret Access Key, Session Token, and expiration for that task’s role session,
-    
-*   An internal credential ID (the UUID used in the metadata path).
-    
+![Alt text](/assets/img/ecscape/hijacked_creds.png)
 
-I saw multiple such messages, corresponding to every task that was currently running on the host. For example, if there were 5 tasks (containers) on the instance (including my own malicious one), I received 5 sets of credentials - one of which corresponded to my own task (which I already had access to anyway), and the others corresponded to roles that were not assigned to me.
+At this moment, per‑task IAM isolation on that EC2 host is effectively gone: a single low‑privileged container has acquired all co‑resident task role credentials. In realistic environments those might include a backup service (broad S3/database rights), a deployer (CloudFormation / IAM modification rights), or a secrets fetcher.
 
-At this point, the isolation was completely broken: I, in a low-privileged container, had just acquired the IAM privileges of **all other tasks** sharing the EC2 instance. In a realistic scenario, those other tasks might include things like:
+Your forged channel remains stealthy because you also mimic the agent’s acknowledgement pattern (incrementing sequence numbers, timely ACKs). ECS allows concurrent authenticated sessions for the same container instance; the real agent keeps operating normally and continues receiving the same credential messages. From the control plane’s perspective nothing appears anomalous—just another session delivering and acknowledging tasks and credentials.
 
-*   A backup task with broad read/write access to S3 or databases,
+**CloudTrail visibility:**
+
+*   The API calls you made to establish the forged channel (e.g. ecs:DiscoverPollEndpoint, the long‑poll / WebSocket authenticated under ecs:Poll) appear as actions by the **instance profile**.
     
-*   A CI/CD task with permissions to deploy infrastructure (CloudFormation, etc.),
-    
-*   Monitoring or logging tasks with access to sensitive data or the ability to assume other roles.
+*   Any _subsequent AWS API calls_ you perform with stolen task credentials show up as those _task role sessions_ (task ARN embedded in the session context). That’s your primary detection surface: a task role being used for operations it normally doesn’t perform, at unusual times, or with abnormal geographic or service access patterns. Merely receiving credential messages over ACS produces no separate CloudTrail event.
     
 
-I could now take those credentials and do whatever those roles allowed. For instance, in my demo, one of the target tasks had an admin-like role. Using its keys, I was able to perform high-privilege AWS actions (like deleting an S3 bucket) which my original container’s role was never permitted to do.
+**Limitations / nuances:** Tasks without a task role obviously yield no credentials. Tasks started later will generate new credential messages you automatically capture as long as your forged channel persists. Execution role credentials (if present) are also pushed and can be harvested, but they typically grant operational capabilities (ECR image pulls, logs, secrets retrieval) rather than broad business data access; still, they may chain with other permissions.
 
-Crucially, because I carefully mimicked the protocol (including sending back expected acknowledgments for each message to ACS), the ECS service didn’t flag anything as wrong. To the ECS control plane, it was business as usual, as if the agent simply got the credentials and acknowledged them. The real ECS agent on the host also received these messages, but it was none the wiser that someone else was listening in.
-
-Throughout this process, **CloudTrail logs** would show the following:
-
-*   The DiscoverPollEndpoint and the WebSocket connection (authenticated via ecs:Poll) would appear as API calls made by the **container instance role**. This is somewhat normal traffic for an ECS host (though typically these calls come from the agent at startup or periodically, not randomly from a container’s actions).
-    
-*   The actual use of stolen credentials: If I immediately use the stolen task creds to call AWS APIs, CloudTrail will log those API calls under the assumed role (the task role’s ARN). From AWS’s point of view, it looks like that task’s role just did something. However, interestingly, because the role session is tied to the original task, CloudTrail might show the **task ARN** in the session context. If I, as Task B, use Task A’s credentials to call, say, s3:DeleteBucket, the CloudTrail entry will list Task A’s role and possibly Task A’s ARN as the session name. This is a potential detection vector: Task A’s role is doing something it normally doesn’t, or doing it at an odd time.
-    
-
-In summary, ECScape allowed a complete breach of the ECS task isolation on an EC2 host: a compromise of one container led to impersonation of the host’s agent and theft of all other containers’ IAM privileges. This is a cloud privilege escalation of significant magnitude.
+**Summary:** ECS centralizes AssumeRole in the control plane, then “moves” (delivers) those ephemeral credentials to the on‑host agent, relying on the secrecy of that upstream channel plus local metadata scoping. By impersonating the agent’s upstream identity, ECScape collapses that trust model: one compromised container passively collects every other task’s IAM application role credentials on the same EC2 instance and can immediately act with their privileges.
 
 ![Alt text](/assets/img/ecscape/ecscape_diagram.jpg)
 
@@ -290,6 +333,9 @@ The implications of ECScape are far-reaching:
         
     *   ENI IDs, private IPs, and the instance’s own attributes (AMI ID, AZ, etc.)
         
+for example:
+![Alt text](/assets/img/ecscape/task_manifest.png)
+
 *   **Stealth and Lack of Immediate Detection:** The actions taken in ECScape are not obviously noisy. Everything the attacker does can appear as normal API calls from the perspective of AWS:
     
     *   The calls to ecs:Poll and related APIs are typical for an ECS agent (though timing and frequency might be a clue).
@@ -346,10 +392,13 @@ However, they took two noteworthy actions:
 ![Alt text](/assets/img/ecscape/aws_doc_change.jpg)
 
 *   **Recognition:** While we didn’t receive a bounty (since it was arguably “working as designed”), AWS did provide a statement of appreciation and said they would add public recognition for the research contribution in their documentation change log. In other words, it was an important enough finding to warrant a doc change and acknowledgment, but not a “vulnerability” in the traditional sense from AWS’s perspective.
-    
 
-From my point of view as the researcher, ECScape was a fascinating journey through AWS’s internals. It underscores a lesson in cloud security: **assume breach** at the unit level (here, the container) and consider what blast radius that breach has. AWS provides great primitives like IAM roles for tasks, but the underlying reality is that if those tasks share a host, there is a shared fate to some extent. As AWS moves more toward isolated paradigms (like Fargate’s per-task VM or Kubernetes pods with strong isolation), these risks diminish – but in the here and now, many organizations still run multi-tenant or multi-role tasks together on EC2 clusters.
+From a researcher’s perspective, ECScape was a deep dive into how ECS stitches together control‑plane role assumption, on‑host credential delivery, and container isolation. The core lesson: **treat each container (or task) as already compromise‑prone and rigorously constrain its blast radius.** AWS’s abstractions (task roles, execution roles, metadata endpoints) are powerful, but when multiple tasks with different privilege levels share an EC2 host, their security is coupled through the agent channel and the instance profile.
 
-In conclusion, the ECScape story is a reminder that in cloud security, the lines between configuration, vulnerability, and design choices can be blurry. It also demonstrates the importance of defense in depth: if any one layer (IMDS access, network namespace isolation, IAM least privilege) had broken the chain, the attack would fail. As cloud users, we should strive to add those layers where we can, and as cloud providers, AWS and others will hopefully provide more granular controls or isolated runtimes to mitigate such issues by design in the future.
+As the ecosystem trends toward stronger isolation models (e.g. Fargate’s per‑task microVM, hardened sandboxing, confidential computing), this specific class of lateral credential harvesting becomes harder. Today, many environments still co‑locate heterogeneous workloads on EC2 capacity, so understanding the _design boundaries_ - not just traditional “vulnerabilities”—is critical.
+
+ECScape illustrates how the boundary between _misconfiguration_, _design trade‑off_, and _exploit chain_ can blur. Defense in depth matters: blocking unnecessary IMDS access, enforcing least‑privilege IAM, isolating high‑value tasks, monitoring for anomalous task role usage, and segmenting workloads by trust level each represent a break point that would have disrupted this chain.
+
+Ultimately, improving security here is a shared responsibility: customers harden deployment patterns; providers continue to refine isolation primitives and credential delivery mechanisms. Shining light on these mechanics enables more informed risk decisions and better monitoring.
 
 Thank you for reading this deep dive. If you have similar experiences or thoughts on ECS security, feel free to share! By shining a light on this mechanism, I hope others will secure their ECS deployments or at least monitor them more vigilantly.
