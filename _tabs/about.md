@@ -7,7 +7,7 @@ order: 4
 
 👋 Hi, I’m **Naor Haziz** - a security researcher, Rust enthusiast, and speaker at security conferences.
 
-![Alt text](/assets/img/naor_talk.jpg)
+![Alt text](/assets/img/naor-talk.jpg)
 
 ---
 

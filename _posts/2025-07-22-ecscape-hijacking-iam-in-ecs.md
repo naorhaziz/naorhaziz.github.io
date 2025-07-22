@@ -194,8 +194,6 @@ Let’s break these down:
 
 The attacker starts from **within a compromised container** (any low-privileged ECS task running on EC2). Because IMDS is available by default, the container can query the instance metadata service. A simple curl request to http://169.254.169.254/latest/meta-data/iam/security-credentials/{InstanceProfileName} will yield the **Access Key, Secret Key, and Session Token** for the EC2 host’s role. These are the credentials the ECS agent normally uses. Now the malicious container has them.
 
-![Alt text](/assets/img/ecscape/imds_role.png)
-
 At this point the attacker possesses **the instance profile’s STS session credentials** (an identity representing the EC2 _container instance_). **These are** _**not**_ **the task role credentials and do** _**not**_ **automatically allow assuming task roles** because:
 
 *   Typical ECS task roles **trust the service principal** ecs-tasks.amazonaws.com, _not_ the instance role.
