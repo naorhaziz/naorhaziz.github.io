@@ -262,4 +262,6 @@ As the industry moves toward stronger isolation models (e.g. AWS Fargate’s per
 
 Ultimately, improving security in scenarios like this is a shared responsibility. Cloud providers need to continually refine isolation primitives and credential delivery mechanisms, and cloud users need to architect with the assumption that any one container might become malicious. By understanding exactly how ECS credential delivery works (as we’ve done here) and where the trust boundaries lie, you can make more informed decisions about your cloud architecture and monitoring.
 
-Thanks for reading! Got similar stories or ideas about ECS security? Drop me a note or open an issue on the repo.
+Thanks for reading! Got similar stories or ideas about ECS security? Feel free to reach out :)
+
+![Alt text](/assets/img/ecscape/meme.jpg)
