@@ -1,7 +1,7 @@
 ---
 title: "Under the Hood of Amazon ECS on EC2: Agents, IAM Roles, and Task Isolation"
 layout: post
-date: 2025-07-16 14:00:00 +0300
+date: 2025-07-16 16:00:00 +0300
 categories: [aws, ecs, security, cloud]
 tags: [ecs, iam, container]
 image: /assets/img/under-the-hood-of-amazon-ecs/amazon-ecs.png
@@ -77,7 +77,11 @@ Think of the ECS agent as a middleman between your containers and the AWS ECS co
 **The EC2 Instance Role and IMDS: Credentials for the Agent**
 -------------------------------------------------------------
 
-Every ECS EC2 instance should be launched with an **IAM role** attached to it (as an EC2 Instance Profile). A common default is an IAM role named **ecsInstanceRole**, which comes with a managed policy **AmazonEC2ContainerServiceforEC2Role**. This **instance role** is used by the ECS agent to call AWS APIs on your behalf. It grants only the limited permissions needed for the agent’s operations – for example:
+Every ECS EC2 instance should be launched with an **IAM role** attached to it (as an EC2 Instance Profile). A common default is an IAM role named **ecsInstanceRole**, which comes with a managed policy **AmazonEC2ContainerServiceforEC2Role**. 
+
+![Alt text](/assets/img/under-the-hood-of-amazon-ecs/ecs-instance-role.png)
+
+This **instance role** is used by the ECS agent to call AWS APIs on your behalf. It grants only the limited permissions needed for the agent’s operations – for example:
 
 *   **ECS control plane:** Permissions like ecs:RegisterContainerInstance, ecs:DiscoverPollEndpoint, ecs:Poll, ecs:Submit\* (to register the instance, poll for tasks/updates, and submit status).
     
