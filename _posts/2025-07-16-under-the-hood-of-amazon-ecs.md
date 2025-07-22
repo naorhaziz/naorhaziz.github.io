@@ -17,7 +17,7 @@ When running containers on Amazon ECS using EC2 instances, there's a lot happeni
     
 *   A single, privileged **ECS agent** on each host registers the node, talks to AWS, starts/stops containers, and hands out IAM creds.
     
-*   AWS (not the agent) assumes each task’s IAM role, then puhttps://naorhaziz.comshes those short‑lived keys down to the agent, which serves them at 169.254.170.2.
+*   AWS (not the agent) assumes each task’s IAM role, then puhshes those short‑lived keys down to the agent, which serves them at 169.254.170.2.
     
 *   The agent’s own identity comes from the EC2 **instance role** via IMDS. If those keys leak, someone can impersonate the agent.
     
