@@ -7,8 +7,10 @@ tags: [ecs, iam, container]
 image: /assets/img/under-the-hood-of-amazon-ecs/amazon-ecs.png
 ---
 
-When running containers on Amazon ECS using EC2 instances, there's a lot happening under the hood on each host. Understanding these internals is crucial for operating ECS securely. In this first part of our deep-dive, we’ll explore how ECS on EC2 works - focusing on the **ECS agent**, the IAM roles and credential delivery mechanism, and where the boundaries (and lack thereof) lie between tasks on the same host. _(In Part 2, we'll leverage this knowledge to examine a real-world privilege escalation exploit in ECS.)_
-[ECScape - Hijacking IAM Privileges in Amazon ECS](/posts/ecscape-hijacking-iam-in-ecs/)
+When running containers on Amazon ECS using EC2 instances, there's a lot happening under the hood on each host. Understanding these internals is crucial for operating ECS securely. In this first part of our deep‑dive, we’ll explore how ECS on EC2 works – focusing on the **ECS agent**, the IAM roles and credential delivery mechanism, and where the boundaries (and lack thereof) lie between tasks on the same host. _(In Part 2, we'll leverage this knowledge to examine a real‑world cross‑task credential exposure scenario in ECS.)_
+[ECScape – Understanding IAM Privilege Boundaries in Amazon ECS](/posts/ecscape-iam-privilege-boundaries-in-ecs/)
+
+> **Note on Security Boundaries:** This deep‑dive focuses on known characteristics of ECS on EC2 rather than disclosing a new vulnerability. On the EC2 launch type, multiple tasks share the same host kernel and resources. This design provides flexibility but means that untrusted or low‑privilege tasks should not be co‑located with high‑privilege tasks. AWS offers **Fargate** – where each task runs in its own micro‑VM – for teams needing stronger isolation. In July 2025 we followed AWS’s responsible disclosure program to share our findings. AWS confirmed this behaviour is a **design consideration**, not a vulnerability, and subsequently updated their [task‑IAM documentation](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task-iam-roles.html) and a [security‑considerations blog post](https://aws.amazon.com/blogs/security/security-considerations-for-running-containers-on-amazon-ecs/).
 
 **TL;DR**
 ---------
@@ -58,7 +60,7 @@ Understanding how the ECS agent manages containers and credentials on EC2 instan
 
 When you launch an ECS cluster on EC2, each EC2 instance (called a _container instance_ in ECS terminology) runs a process called the **ECS agent**. The agent is essentially a specialized **Docker/Container orchestrator** that connects your EC2 host to the ECS control plane. AWS provides the agent as an open-source application (it even runs as a privileged Docker container itself). Its main responsibilities include:
 
-*   **Cluster Registration & Heartbeat:** When the EC2 instance starts, the agent registers itself with your ECS cluster using the cluster’s name/ARN. It maintains a long-lived connection (or long-poll) with the ECS service to report status and retrieve updates (like new tasks to run).https://naorhaziz.com/posts/ecscape-hijacking-iam-in-ecs/
+*   **Cluster Registration & Heartbeat:** When the EC2 instance starts, the agent registers itself with your ECS cluster using the cluster’s name/ARN. It maintains a long-lived connection (or long-poll) with the ECS service to report status and retrieve updates (like new tasks to run).
     
 *   **Task Lifecycle Management:** Upon receiving instructions to start containers (tasks), the agent will pull the required images (integrating with Amazon ECR if needed), create and run containers via the local Docker daemon, and later stop or clean them up as instructed. It also reports back the status of tasks (e.g., RUNNING, STOPPED, exit codes).
     
@@ -245,6 +247,12 @@ In theory, this isolates IAM credentials on a per-task basis, which is a great s
 5.  **Failure Domain:** If the agent—or its instance‑role keys—are compromised, the boundary between tasks vanishes.
 
 
-Now that we’ve covered how ECS on EC2 operates - from the agent and instance roles to task IAM credentials and isolation boundaries – we have the necessary background to understand a fascinating (and critical) security weakness that was discovered. In **Part 2**, we will explore **“ECScape,”** an exploit where a malicious container on ECS **hijacks IAM privileges across co-located tasks**. We’ll see how the assumptions above can be subverted, allowing one container to impersonate the ECS agent and retrieve **all** the task credentials on a host. Stay tuned!
+Now that we’ve covered how ECS on EC2 operates – from the agent and instance roles to task IAM credentials and isolation boundaries – we have the necessary background to understand a fascinating **cross‑task credential exposure scenario**. In **Part 2**, we’ll explore **“ECScape,”** a technique where a malicious container on ECS can impersonate the ECS agent and retrieve credentials intended for other tasks on the same host. This isn’t a vulnerability in AWS but a design characteristic of the EC2 launch type that highlights the importance of isolation and least privilege. Stay tuned!
 
-➡️ **Continue to Part 2:** [ECScape - Hijacking IAM Privileges in Amazon ECS](/posts/ecscape-hijacking-iam-in-ecs/)
+➡️ **Continue to Part 2:** [ECScape – Understanding IAM Privilege Boundaries in Amazon ECS](/posts/ecscape-iam-privilege-boundaries-in-ecs/)
+
+## Responsible Disclosure and AWS Collaboration
+
+In July 2025 our team reported the cross‑task credential exposure described in this series to AWS through their coordinated disclosure program. AWS reviewed our research and determined that the behaviour is a **design consideration** of ECS on EC2 rather than a security vulnerability. They expressed appreciation for our work and collaborated to improve public documentation. AWS updated guidance on [task IAM roles](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task-iam-roles.html) and published a [security considerations blog post](https://aws.amazon.com/blogs/security/security-considerations-for-running-containers-on-amazon-ecs/) that explicitly states that tasks running on the same EC2 instance may potentially access credentials belonging to other tasks, recommending the use of Fargate for stronger isolation and careful monitoring of task role usage via CloudTrail.
+
+By sharing our findings we hope to help ECS users design secure architectures and make informed decisions about launch types and isolation boundaries, and to demonstrate our commitment to customer education and partnership with AWS.

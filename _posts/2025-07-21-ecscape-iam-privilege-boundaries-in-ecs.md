@@ -1,5 +1,5 @@
 ---
-title: "ECScape: Hijacking IAM Privileges in Amazon ECS"
+title: "ECScape: Understanding IAM Privilege Boundaries in Amazon ECS"
 layout: post
 date: 2025-07-21 16:00:00 +0300
 categories: [aws, ecs, security, cloud]
@@ -7,9 +7,9 @@ tags: [ecs, iam, container, privilege escalation, blackhat, fwdcloudsec]
 image: /assets/img/ecscape/ecscape.png
 ---
 
-This post is Part 2 of a series on Amazon ECS security. In [**Part 1 - Under the Hood of Amazon ECS on EC2**](/posts/under-the-hood-of-amazon-ecs/), we explored how the ECS agent, IAM roles, and the ECS control plane (ACS) work together to provide credentials to tasks. In this Part 2, we focus on a critical vulnerability that exploits those mechanisms to hijack IAM privileges across ECS tasks.
+This post is Part 2 of our educational series on Amazon ECS security. In [**Part 1 – Under the Hood of Amazon ECS on EC2**](/posts/under-the-hood-of-amazon-ecs/), we explored how the ECS agent, IAM roles and the ECS control plane provide credentials to tasks. Here we’ll demonstrate how those mechanisms can lead to a **known risk** when tasks with different privilege levels share the same EC2 host. This cross‑task credential exposure is a design characteristic of the EC2 launch type, and it underscores why **Fargate** (where each task runs in its own micro‑VM) offers stronger isolation. Our goal is to help you understand the IAM privilege boundaries in Amazon ECS and how to configure your services securely.
 
-Cloud environments offer unparalleled flexibility and scalability, but they also introduce complex security considerations. In Amazon Web Services (AWS), subtle interactions between services can lead to unexpected vulnerabilities. In this post, I’ll share how I discovered a critical cross-container IAM credential theft vulnerability in Amazon ECS (Elastic Container Service) – a flaw that breaks the assumed IAM role isolation between ECS tasks. This is the story of **ECScape**, an exploit that hijacks IAM privileges across co-located containers, how we pulled it off, and what it means for cloud container security.
+Cloud environments offer unparalleled flexibility and scalability, but they also introduce complex security considerations. Subtle interactions between AWS services can lead to unintended privilege exposure if you assume container‑level isolation where none exists. In this post, I’ll walk you through how I discovered this cross‑container IAM credential exposure in Amazon ECS (Elastic Container Service), demonstrate the technique (dubbed **“ECScape”**), and share lessons learned for securing your own environments. By demystifying the control plane, we hope to equip readers with the knowledge to architect for isolation and to advocate for improvements.
 
 **Resources**
 - **Conference talks:**  
@@ -22,11 +22,11 @@ Cloud environments offer unparalleled flexibility and scalability, but they also
 **TL;DR**
 ---------
 
-*   **Vulnerability Discovered:** I found a way to abuse an undocumented ECS internal protocol to grab AWS credentials belonging to other ECS tasks on the same EC2 instance. A malicious container with a low-privileged IAM role can hijack the permissions of a higher-privileged container running on the same host.
+*   **Key Insight:** We identified a way to abuse an undocumented ECS internal protocol to grab AWS credentials belonging to other ECS tasks on the same EC2 instance. A malicious container with a low‑privileged IAM role can obtain the permissions of a higher‑privileged container running on the same host.
     
-*   **Real-World Impact:** In practice, this means a compromised app in your ECS cluster could escalate to admin privileges by stealing credentials from a more privileged task. This undermines IAM role isolation – one container can effectively become any other on the same host in terms of AWS access.
+*   **Real‑World Impact:** In practice, this means a compromised app in your ECS cluster could assume the role of a more privileged task by stealing its credentials. This undermines IAM role isolation – one container can effectively become any other on the same host in terms of AWS access.
     
-*   **How It Works:** Amazon ECS tasks retrieve credentials via a local metadata service (169.254.170.2) with a unique credentials endpoint for each task. We discovered that by exploiting how ECS identifies tasks in this process, an attacker can masquerade as the ECS agent and obtain credentials for _any_ task on the host. No container breakout (no host root access) was required – just clever network and system trickery from within the container’s own namespace.
+*   **How It Works:** Amazon ECS tasks retrieve credentials via a local metadata service (169.254.170.2) with a unique credentials endpoint for each task. We discovered that by **leveraging** how ECS identifies tasks in this process, a malicious actor could masquerade as the ECS agent and obtain credentials for _any_ task on the host. No container breakout (no host root access) was required – just clever network and system trickery from within the container’s own namespace.
     
 *   **Stealth Factor:** The stolen keys work exactly like the real task’s keys. AWS CloudTrail will attribute API calls to the victim task’s role, so initial detection is tough – it appears as if the victim task is performing the actions.
     
@@ -63,9 +63,9 @@ Curiosity led me down a rabbit hole of packet capture. I set up a small local pr
 
 At this moment, I realized that the ECS control plane was actively **pushing task credentials** down to the agent over this WebSocket channel. Normally, this is fine - it’s how the agent gets credentials to give to each task’s container - but it got me thinking: if I could somehow tap into that channel, I might capture credentials that weren’t meant for my container. My thought was: **if the control plane hands out all task credentials to the agent, could I pose as the agent and trick AWS into sending** _**me**_ **those credentials?**
 
-That question was the genesis of **ECScape** - an attack that is essentially about escaping the container’s confines and impersonating the ECS agent to access everything.
+That question was the genesis of **ECScape** – a **scenario** that explores how escaping the container’s confines and impersonating the ECS agent could allow access to other tasks’ credentials.
 
-**The ECScape Exploit: Impersonating the ECS Agent to Steal All Credentials**
+**How ECScape Works: Impersonating the ECS Agent to Access Other Credentials**
 -----------------------------------------------------------------------------
 
 Now we’ll walk through how ECScape actually works in practice, step by step. The goal for the attacker (a malicious process in one container) is to obtain the IAM credentials of all other tasks on the same EC2 host. To do this, the attacker will:
@@ -191,6 +191,10 @@ The implications of ECScape are far-reaching for anyone running ECS tasks on sha
 *   **Cross-Task Privilege Escalation:** A fundamental promise of containerized workloads is that one compromised application remains isolated from others. ECScape shatters that assumption for ECS on EC2. A low-privileged task can become a high-privileged one by simply stealing its IAM credentials.  In effect, any task can impersonate any other task on the same host, permission‑wise. This breaks multi-tenancy and defense-in-depth boundaries. For example, imagine a security scanning container (with only read-only access to a few resources) running alongside a database backup container (with full database and S3 backup access). If the scanner container is compromised, it could use ECScape to grab the backup container’s IAM role and thereby gain direct access to the database or backups, completely undermining the isolation you expected.
     
 *   **Host Role Impersonation:** By stealing the **ecsInstanceRole** credentials from IMDS in Step 1, an attacker can also impersonate the ECS container _instance_ itself when talking to the ECS control plane. This means they could potentially register fake tasks, issue commands to stop or start tasks (effectively causing Denial of Service or rogue deployments), or even register new container instances into the cluster. Essentially, they can pretend to be the ECS agent managing that instance. For example, the attacker could use the instance role to **drain** all tasks on the host (stop them). Since the instance role often has permissions to update the ECS agent status and respond to ACS directives, the attacker has considerable power over the cluster’s state.
+
+*   **Execution Role Theft & Secrets Exposure:** The ECS control plane not only sends application role credentials but also delivers **task execution role** credentials down to the agent. These execution credentials are intended for the ECS service itself to perform operations such as pulling container images from private ECR registries, fetching secrets from Secrets Manager or Parameter Store, and writing logs to CloudWatch. They are **not meant to be used by your application code**. In an ECScape scenario, however, a malicious actor can harvest those execution-role tokens alongside application-role tokens. With them, you could pull private container images belonging to other services, access secrets or environment variables that were intended only for the agent to use, or read/write log streams for other tasks. In other words, even if the exposed application roles are locked down, stealing execution-role credentials can still lead to **indirect data exfiltration** across tasks via ECR, Secrets Manager, Parameter Store or CloudWatch Logs.
+
+![Alt text](/assets/img/ecscape/task-execution-role-docs.png)
     
 *   **Metadata Exfiltration & Reconnaissance:** Impersonating the agent yields more than just credentials. The ACS stream also carries rich **task metadata** about the environment, which an attacker can collect for reconnaissance. This includes things like full lists of running Task ARNs and their task definition revisions, container image IDs and digests, each task’s CPU and memory configuration, network details (ENI IDs, IP addresses), and the container instance’s own attributes (AMI ID, Availability Zone, etc.). This information can help the attacker map out what’s running on the host and identify high-value targets.
     
@@ -239,14 +243,14 @@ AWS’s official response to this issue was that ECS was operating within its _i
     *   On the host side, consider monitoring network connections. The ECS agent typically only connects out to specific AWS endpoints. If you detect a container process establishing a WebSocket to an AWS domain that it normally wouldn’t, that’s a red flag. Similarly, any calls to ECS APIs (ecs:Poll etc.) originating from containers should be nonexistent in a normal environment. While challenging, advanced detection could involve a sidecar or eBPF-based watcher looking for usage of the instance role credentials from within containers.
         
 
-By implementing the above – **especially locking down IMDS for tasks** – you can significantly reduce the risk of an ECScape-style attack. In fact, AWS’s documentation was updated after this research to explicitly warn that “tasks running on the same EC2 instance may potentially access credentials belonging to other tasks on that instance,” and it strongly encourages using Fargate for stronger isolation and monitoring cross-task role usage via CloudTrail.
+By implementing the above – **especially locking down IMDS for tasks** – you can significantly reduce the risk of an ECScape‑style scenario. In fact, AWS’s documentation was updated after this research to explicitly warn that “tasks running on the same EC2 instance may potentially access credentials belonging to other tasks on that instance,” and it strongly encourages using Fargate for stronger isolation and monitoring cross‑task role usage via CloudTrail.
 
-**AWS’s Response and Final Thoughts**
+**Responsible Disclosure and AWS Response**
 -------------------------------------
 
 ![Alt text](/assets/img/ecscape/aws-response.jpg)
 
-When we reported ECScape to AWS, they acknowledged the behavior but replied that it “does not present a security concern for AWS” – essentially, they viewed it as working within the intended trust model of ECS on EC2. In AWS’s eyes, containers sharing an EC2 instance are not guaranteed isolation from each other unless the user provides that isolation. They did not issue a CVE or a security bulletin for this, since it wasn’t considered a vulnerability breaking AWS’s security boundaries (from their perspective).
+When we reported ECScape to AWS through their coordinated disclosure program, they reviewed our findings and confirmed that the behaviour we observed is a **design consideration** of ECS on EC2 rather than a vulnerability. In AWS’s eyes, containers sharing an EC2 instance are implicitly part of the same trust domain unless the user enforces isolation. They did not issue a CVE or a security bulletin because this does not break AWS’s security boundaries; instead, they emphasised that customers should architect accordingly.
 
 However, AWS did take two noteworthy actions in response:
 
