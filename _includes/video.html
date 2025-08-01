@@ -1,10 +1,8 @@
-{% assign src_webm   = include.webm   | default: '' %}
 {% assign src_mp4    = include.mp4    | default: '' %}
 {% assign poster     = include.poster | default: '' %}
 <video controls playsinline preload="metadata"
        {% if poster %}poster="{{ poster }}"{% endif %}
        style="max-width:100%;height:auto;">
-  {% if src_webm %}<source src="{{ src_webm }}" type="video/webm">{% endif %}
   {% if src_mp4  %}<source src="{{ src_mp4  }}" type="video/mp4">{% endif %}
   Sorry, your browser doesn't support embedded videos.
 </video>

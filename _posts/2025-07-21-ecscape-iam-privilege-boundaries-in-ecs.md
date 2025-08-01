@@ -211,11 +211,20 @@ The implications of ECScape are far-reaching for anyone running ECS tasks on sha
 *   **No Misconfiguration Required:** Perhaps the scariest part of ECScape is that it doesn’t rely on any obvious user misconfiguration. All the default behaviors and settings of ECS on EC2 (IMDS enabled, instance role with the default ECS permissions, multiple tasks sharing an EC2 host) are enough for the attack to work. In other words, hundreds of millions of ECS tasks running under default conditions were hypothetically vulnerable. This isn’t a case of “you left something open that you shouldn’t have” – it’s more like a design flaw in how credentials were isolated on shared hosts.       
 
 {% include video.html
-   webm="/assets/video/ecscape/demo.webm"
    mp4="/assets/video/ecscape/demo.mp4"
    poster="/assets/img/ecscape/ecscape-demo-thumb.jpg" %}
 
-In the live demo of ECScape, I showcased this chaining effect: I started in a task that had an IAM policy of “deny all” (it wasn’t allowed to call any AWS API itself). On the same host, another task had a role with broad administrative permissions. Using ECScape, the low-privileged task grabbed the admin role credentials of the other task, then used those credentials to delete an S3 bucket that only an admin could delete. The takeaway is clear – a breach in one container could directly compromise critical resources across your cloud environment.
+In the live demo of ECScape, I deploy three ECS tasks on the same EC2 instance to demonstrate how a low-privileged container can escalate its privileges and compromise sensitive resources:
+* s3-control-task: This task has a task role with S3 full access, but no task execution role.
+* database-task: This task has no task role, but its task execution role has permission to retrieve a secret named db-secret, which is injected into the container as an environment variable.
+* ecscape-task: This is the attacker-controlled task. It has a task role with a Deny * policy (so it should not be able to access any AWS APIs) and no task execution role.
+
+During the demo, I show how the ecscape-task:
+* Grabs the task role credentials of s3-control-task and uses them to delete an S3 bucket — something its role couldn't do before.
+* Steals the task execution role credentials of database-task and uses them to access and print the contents of db-secret in plaintext.
+
+The key takeaway: even a container with no effective permissions can compromise high-value resources if it shares a host with more privileged tasks. This breaks the isolation assumptions many teams rely.
+
 
 ![Alt text](/assets/img/ecscape/impact.jpg)
 
