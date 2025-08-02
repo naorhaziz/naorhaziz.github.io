@@ -15,15 +15,15 @@ When running containers on Amazon ECS using EC2 instances, there's a lot happeni
 **TL;DR**
 ---------
 
-*   On EC2, ECS tasks share the same host OS; on Fargate each task gets its own micro‑VM. Different isolation model, different risk.
-    
+*   On EC2, ECS tasks share the same host instance; on Fargate, each task executes in a dedicated VM. Different isolation model, different risk.
+
 *   A single, privileged **ECS agent** on each host registers the node, talks to AWS, starts/stops containers, and hands out IAM creds.
     
 *   AWS (not the agent) assumes each task’s IAM role, then puhshes those short‑lived keys down to the agent, which serves them at 169.254.170.2.
     
 *   The agent’s own identity comes from the EC2 **instance role** via IMDS. If those keys leak, someone can impersonate the agent.
     
-*   Per‑task isolation depends on namespaces, iptables, and the agent behaving correctly—containers aren’t a hard boundary on EC2.
+*   Per‑task isolation depends on namespaces, iptables, and the agent behaving correctly—containers aren’t a hard security boundary on EC2.
 
 **Recommended Primers**
 
@@ -46,7 +46,10 @@ If any of the acronyms below feel rusty, a quick skim of these docs will make th
 **ECS Launch Types: EC2 vs. Fargate**
 -------------------------------------
 
-ECS supports two launch models for running containers: **EC2** and **Fargate**. With **EC2 launch type**, you manage a cluster of your own EC2 instances (virtual machines) that run the ECS agent and host your containers. In contrast, **Fargate** is a managed option where AWS runs tasks in isolation without exposing the underlying server to you.
+ECS supports three launch models for running containers: **EC2**, **Fargate**, and **ECS Anywhere**.
+With the **EC2 launch type**, you manage a cluster of your own EC2 instances that run the ECS agent and host your containers.
+In contrast, **Fargate** is a managed option where AWS runs tasks in isolation without exposing the underlying server to you.
+**ECS Anywhere** allows you to run ECS tasks on your own on-premises infrastructure or other compute environments using the ECS agent.
 
 **Why does this matter?** In Fargate, each task gets its **micro-VM** and does _not_ share the kernel, CPU, memory, or network interface with other tasks. That design gives you a strong, hypervisor‑level isolation boundary out of the box.
 By contrast, when you run ECS tasks on **EC2 instances**, **multiple containers live side‑by‑side on the same host OS**. They share the Linux kernel and other system resources, blurring isolation boundaries.
@@ -129,7 +132,8 @@ If a principal has those two actions – nothing more – it can act as _the_ ag
 The agent starts by fetching temporary keys from IMDS for the **instance role** (usually ecsInstanceRole). Those credentials sign every subsequent control‑plane request.
 
 ### Step 1 - DiscoverPollEndpoint
-The agent calls **DiscoverPollEndpoint** API, using ecs:DiscoverPollEndpoint permission. This endpoint discovery happens at startup and periodically during operation for endpoint rotation.
+The agent calls the **DiscoverPollEndpoint** API using the ecs:DiscoverPollEndpoint permission.
+This API provides the ECS agent with the current control and telemetry endpoints. In some cases, it may also include a serviceConnectEndpoint, which is used by the service connect proxy (not by the ECS agent itself).
 Typical response:
 ```
 {
@@ -138,7 +142,7 @@ Typical response:
   "serviceConnectEndpoint":  "https://ecs-sc-1.us-east-1.amazonaws.com",
 }
 ```
-The URLs are **time‑scoped** and may rotate every few hours for load‑balancing and security. The serviceConnectEndpoint is used for Service Connect configuration when applicable.
+Note: These endpoints are time-scoped and may change over time. The values returned are not guaranteed to remain constant and may vary for reasons such as regional load balancing.
 
 ![Alt text](/assets/img/under-the-hood-of-amazon-ecs/discover-poll-endpoint.png)
 
@@ -200,14 +204,14 @@ Agent → Control Plane: "Task X now running, credentials received"
 
 ### Protocol Evolution
 
-Looking at the AWS SDK source, we can see the protocol has evolved to include **Service Connect endpoints**, indicating Amazon's continued investment in this internal communication channel. The service connect endpoint field in DiscoverPollEndpointOutput suggests ACS now handles service mesh configuration in addition to traditional task orchestration.
+Looking at the AWS SDK source, we can see the protocol has evolved to include **Service Connect endpoints**, indicating Amazon's continued investment in this internal communication channel.
 
 The protocol's undocumented nature means it can evolve rapidly without backward compatibility concerns, allowing Amazon to optimize for performance and security without external API constraints.
 
 **From Instance Role to Task Role: Credential Isolation per Task**
 ------------------------------------------------------------------
 
-One of the most convenient features of ECS is the ability to assign an **IAM role to a task** (often called the _task role_ or _IAM task role_). This allows the application code running in the container to call AWS APIs (S3, DynamoDB, etc.) without embedding AWS keys in the container image or using long-lived credentials. Each task’s role is specified in the task definition, and different tasks can have different IAM roles. The expectation is that **each task should only be able to use its own IAM role’s permissions**, and not touch credentials belonging to other tasks.
+One of the most convenient features of ECS is the ability to assign an **IAM role to a task** (often called the _task role_ or _IAM task role_). This allows the application code running in the container to call AWS APIs (S3, DynamoDB, etc.) without embedding AWS keys in the container image or using long-lived credentials. Each task’s role is specified in the task definition, and different tasks can have different IAM roles. The naive expectation (more on that later) is that **each task should only be able to use its own IAM role’s permissions**, and not access credentials intended for other tasks.
 
 **So how does ECS provide each task with credentials for its role?** The flow works like this:
 
@@ -221,14 +225,25 @@ One of the most convenient features of ECS is the ability to assign an **IAM rol
 
 ![Alt text](/assets/img/under-the-hood-of-amazon-ecs/credentials-acs.png)
         
-This mechanism means **each task gets credentials scoped to its IAM role, and the credentials are delivered at runtime**. The tasks do not see each other’s credentials because:
+This mechanism means each task gets straightforward access to credentials scoped to its IAM role. These credentials are delivered and updated at runtime for automatic consumption by the SDK.
+Tasks normally do not see each other’s credentials because:
 
-*   Each credentials payload has a unique UUID and is only delivered to the agent (not stored in a place other tasks can read).
+*   Each credentials payload has a unique UUID and is only delivered to the agent, it’s not stored in a location accessible by other tasks.
     
 *   In modern ECS (with awsvpc networking), each task runs in its own network namespace, so it can only reach the 169.254.170.2 endpoint _within that namespace_, which the agent routes to the correct credentials. Tasks shouldn't be able to query the agent for another task’s URI because they can’t even see that other task’s network interface or environment variables.
     
-*   Even in bridge network mode, the agent sets up iptables rules to restrict access so that one container can only get its own credentials via the specific URI.
+*   Even in bridge network mode, the agent sets up iptables rules to restrict access so that one container can only get its own credentials via the specific URI. But note that by
+default the containers can still easily reach the instance metadata service, and thus have access to the agent's credentials and privileges as well as their own.
     
+At first glance, this per-task credential scoping is a great security feature. It avoids the historical problem of sharing the instance’s IAM role across all containers. For example, a web app task might have access to a specific S3 bucket, while an admin task on the same host has broader privileges—and the two shouldn’t interfere.
+
+However, it’s important to note that this mechanism doesn’t establish a hard security boundary. The ECS agent ultimately decides which credentials to serve in response to requests at 169.254.170.2. So if an attacker can deploy code to a container and influence the agent (or spoof it), they may be able to fetch credentials not intended for their task. In Part 2, we’ll demonstrate exactly how this can happen.
+
+AWS documentation also explicitly notes that ECS does not treat this isolation as a strict boundary:
+* “Task IAM roles allow you to specify IAM permissions for your containers without requiring those permissions to be specified using EC2 instance profiles…”
+
+* “Task credentials have a context of ‘taskArn’ that is attached to the session, so CloudTrail logs show which task the role was used by.”
+
 In theory, this isolates IAM credentials on a per-task basis, which is a great security feature. It avoids the historical problem of sharing the instance’s IAM role among all tasks. Now, a web app container might only have rights to a specific S3 bucket, while a different admin task on the same host might have broader rights - and the two shouldn’t conflict.
 
 **However,** as with any security mechanism, it assumes the controls are working correctly. If there’s any way for a container to break out of its network namespace or trick the agent, those assumptions could fail. Remember that the agent itself ultimately decides “who gets what credentials” when serving that 169.254.170.2 request. If an attacker finds a bug or misconfiguration in that process, they could potentially obtain credentials not meant for them. In Part 2, we will see exactly such a scenario.
@@ -244,8 +259,7 @@ In theory, this isolates IAM credentials on a per-task basis, which is a great s
     
 4.  **Trust Equals Instance Role:** The control plane trusts the agent because it signs requests with the instance‑role credentials.
     
-5.  **Failure Domain:** If the agent—or its instance‑role keys—are compromised, the boundary between tasks vanishes.
-
+5.  **Failure Domain:** If the agent or its instance-role credentials are compromised, an attacker may gain access to any task’s credentials on the host, despite the assumed per-task separation.
 
 Now that we’ve covered how ECS on EC2 operates – from the agent and instance roles to task IAM credentials and isolation boundaries – we have the necessary background to understand a fascinating **cross‑task credential exposure scenario**. In **Part 2**, we’ll explore **“ECScape,”** a technique where a malicious container on ECS can impersonate the ECS agent and retrieve credentials intended for other tasks on the same host. This isn’t a vulnerability in AWS but a design characteristic of the EC2 launch type that highlights the importance of isolation and least privilege. Stay tuned!
 
@@ -253,6 +267,6 @@ Now that we’ve covered how ECS on EC2 operates – from the agent and instanc
 
 ## Responsible Disclosure and AWS Collaboration
 
-In July 2025 our team reported the cross‑task credential exposure described in this series to AWS through their coordinated disclosure program. AWS reviewed our research and determined that the behaviour is a **design consideration** of ECS on EC2 rather than a security vulnerability. They expressed appreciation for our work and collaborated to improve public documentation. AWS updated guidance on [task IAM roles](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task-iam-roles.html) and published a [security considerations blog post](https://aws.amazon.com/blogs/security/security-considerations-for-running-containers-on-amazon-ecs/) that explicitly states that tasks running on the same EC2 instance may potentially access credentials belonging to other tasks, recommending the use of Fargate for stronger isolation and careful monitoring of task role usage via CloudTrail.
+In July 2025 our team reported the cross‑task credential exposure described in this series to AWS through their coordinated disclosure program. AWS reviewed our research and determined that the behaviour is a **design consideration** of ECS on EC2 rather than a security vulnerability. They expressed appreciation for our work and collaborated to improve public documentation. AWS updated guidance on [task IAM roles](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task-iam-roles.html) and updated a [security considerations blog post](https://aws.amazon.com/blogs/security/security-considerations-for-running-containers-on-amazon-ecs/) that explicitly states that tasks running on the same EC2 instance may potentially access credentials belonging to other tasks, recommending the use of Fargate for stronger isolation and careful monitoring of task role usage via CloudTrail.
 
 By sharing our findings we hope to help ECS users design secure architectures and make informed decisions about launch types and isolation boundaries, and to demonstrate our commitment to customer education and partnership with AWS.
